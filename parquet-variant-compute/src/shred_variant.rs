@@ -416,10 +416,14 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
         let mut seen = std::collections::HashSet::new();
         let mut partially_shredded = false;
         for (field_name, value) in obj.iter() {
+            if !seen.insert(field_name) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "duplicate field name '{field_name}' in variant object"
+                )));
+            }
             match self.typed_value_builders.get_mut(field_name) {
                 Some(typed_value_builder) => {
                     typed_value_builder.append_value(value)?;
-                    seen.insert(field_name);
                 }
                 None => {
                     object_builder.insert_bytes(field_name, value);
@@ -821,6 +825,40 @@ mod tests {
             VariantRow::Null => builder.append_null(),
         });
         builder.build()
+    }
+
+    #[test]
+    fn test_shred_variant_rejects_duplicate_field_names() {
+        let metadata: &[u8] = &[0x01, 0x01, 0x00, 0x01, b'a'];
+        let value: &[u8] = &[0x02, 0x02, 0x00, 0x00, 0x00, 0x02, 0x04, 12, 0, 12, 1];
+
+        let metadata_column: ArrayRef = Arc::new(BinaryViewArray::from(vec![Some(metadata)]));
+        let value_column: ArrayRef = Arc::new(BinaryViewArray::from(vec![Some(value)]));
+        let struct_array = StructArray::try_new(
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ]),
+            vec![metadata_column, value_column],
+            None,
+        )
+        .unwrap();
+        let array = VariantArray::try_new(&struct_array).unwrap();
+
+        for field_name in ["a", "b"] {
+            let as_type = DataType::Struct(Fields::from(vec![Field::new(
+                field_name,
+                DataType::Int8,
+                true,
+            )]));
+            let error = shred_variant(&array, &as_type).unwrap_err();
+            match error {
+                ArrowError::InvalidArgumentError(message) => {
+                    assert!(message.contains("duplicate field name 'a'"));
+                }
+                error => panic!("expected InvalidArgumentError, got {error:?}"),
+            }
+        }
     }
 
     trait TestListLikeArray: ListLikeArray {
